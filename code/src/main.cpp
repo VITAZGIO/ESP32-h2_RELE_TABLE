@@ -7,6 +7,7 @@
 
 #include "Zigbee.h"
 #include <esp_adc/adc_oneshot.h>
+#include <driver/gpio.h>
 #include "OneWireNg_CurrentPlatform.h"
 #include "drivers/DSTherm.h"
 #include "utils/Placeholder.h"
@@ -106,6 +107,7 @@ bool zb_ready = false;   // true только после Zigbee.connected()
 // Антидребезг кнопок
 uint32_t last_button_press_ms = 0;
 int last_button = -1;
+int btn_cur_state = -1;   // подтверждённое состояние кнопок: -1 отпущено, 0..5 кнопка
 const uint32_t DEBOUNCE_MS = 50;
 
 // Системная кнопка (6-я)
@@ -117,22 +119,55 @@ const uint32_t FACTORY_RESET_HOLD_MS = 3000;
 // =============== ZIGBEE CALLBACKS ====================
 // =====================================================
 
+// Защита от петли: setLight() сам дёргает onLightChange
+static volatile bool selfReport = false;
+static void reportLight(ZigbeeLight *ep, bool value) {
+  selfReport = true;
+  ep->setLight(value);
+  selfReport = false;
+}
+
+// Флаг состояния сети
+static bool zbOnline = false;
+
+// ---- Очередь запросов из HA (колбэк только кладёт, работу делает loop) ----
+enum ReqType : uint8_t { REQ_RELAY1, REQ_RELAY2, REQ_USB, REQ_FAN };
+struct Req { ReqType type; bool value; float fval; };
+static const uint8_t Q_SIZE = 16;
+static volatile Req  q_buf[Q_SIZE];
+static volatile uint8_t q_head = 0, q_tail = 0;
+
+static void queuePush(ReqType t, bool v, float f = 0.0f) {
+  uint8_t next = (uint8_t)((q_head + 1) % Q_SIZE);
+  if (next == q_tail) return;          // очередь полна — молча теряем
+  q_buf[q_head].type = t;
+  q_buf[q_head].value = v;
+  q_buf[q_head].fval = f;
+  q_head = next;
+}
+
+static bool queuePop(Req &r) {
+  if (q_tail == q_head) return false;
+  r.type  = q_buf[q_tail].type;
+  r.value = q_buf[q_tail].value;
+  r.fval  = q_buf[q_tail].fval;
+  q_tail = (uint8_t)((q_tail + 1) % Q_SIZE);
+  return true;
+}
+
 void onRelay1Change(bool state) {
-  relay_state[0] = state;
-  digitalWrite(RELAY_1_PIN, state ? LOW : HIGH);   // active-LOW реле
-  Serial.printf("[ZB] Relay 1 -> %s\n", state ? "ON" : "OFF");
+  if (selfReport) return;
+  queuePush(REQ_RELAY1, state);
 }
 
 void onRelay2Change(bool state) {
-  relay_state[1] = state;
-  digitalWrite(RELAY_2_PIN, state ? LOW : HIGH);   // active-LOW реле
-  Serial.printf("[ZB] Relay 2 -> %s\n", state ? "ON" : "OFF");
+  if (selfReport) return;
+  queuePush(REQ_RELAY2, state);
 }
 
 void onUSBChange(bool state) {
-  usb_power_state = state;
-  digitalWrite(MOSFET_USB_PIN, state ? HIGH : LOW);
-  Serial.printf("[ZB] USB -> %s\n", state ? "ON" : "OFF");
+  if (selfReport) return;
+  queuePush(REQ_USB, state);
 }
 
 // Пустой колбэк для кнопок-лайтов (убирает warning, тумблер локальный)
@@ -142,12 +177,8 @@ void onButtonLightChange(bool state) {
 
 // Вентилятор (analog 0..100 -> скорость 0..10)
 void onFanChange(float value) {
-  int level = (int)round(value / 10.0f);
-  if (level < 0) level = 0;
-  if (level > 10) level = 10;
-  current_fan_speed = level;
-  ledcWrite(FAN_PWM_PIN, FAN_SPEED_PWM[level]);
-  Serial.printf("[ZB] Fan -> %.0f%% (level %d, PWM %d)\n", value, level, FAN_SPEED_PWM[level]);
+  if (selfReport) return;
+  queuePush(REQ_FAN, false, value);
 }
 
 // =====================================================
@@ -165,28 +196,38 @@ static void adc_init() {
     .bitwidth = ADC_BITWIDTH_12,
   };
   adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_0, &config);
-  Serial.println("[ADC] Initialized on GPIO1");
+
+  // ADC-драйвер сбрасывает подтяжку пина — возвращаем её ПОСЛЕ настройки канала.
+  // Без внешней лестницы вход иначе болтается и ловит наводки.
+  gpio_set_pull_mode((gpio_num_t)BUTTONS_ADC_PIN, GPIO_PULLUP_ONLY);
+  gpio_pullup_en((gpio_num_t)BUTTONS_ADC_PIN);
+
+  Serial.println("[ADC] Initialized on GPIO1 (pull-up on)");
 }
 
 static int read_button_adc() {
   if (!adc_handle) return 4095;
   // 5 чтений, берём среднее — гасит шум на неподключённом/длинном входе
   int sum = 0, v = 0;
-  for (int k = 0; k < 5; k++) {
+  for (int k = 0; k < 3; k++) {
     adc_oneshot_read(adc_handle, ADC_CHANNEL_0, &v);
     sum += v;
-    delayMicroseconds(50);
   }
-  return sum / 5;
+  return sum / 3;
 }
 
+// Окна ADC — откалибровано по реальным замерам на плате.
+// Замеры: к1=257..264  к2=739..747  к3=1327..1359  к4=1980..2005
+//         к5=2523..2702 (плавает)   к6=3039..3175   отпущено=3393..3477
+static const int BTN_LO[6] = {  160,  640, 1220, 1870, 2440, 2960 };
+static const int BTN_HI[6] = {  380,  850, 1470, 2120, 2790, 3260 };
+
+// Кнопка засчитывается ТОЛЬКО если ADC попал в её окно.
+// Всё остальное (в т.ч. отпущенное ~3400) -> "не нажато".
 static int detect_button_press(int adc_value) {
-  if (adc_value < ADC_THRESHOLD_1) return 0;
-  if (adc_value < ADC_THRESHOLD_2) return 1;
-  if (adc_value < ADC_THRESHOLD_3) return 2;
-  if (adc_value < ADC_THRESHOLD_4) return 3;
-  if (adc_value < ADC_THRESHOLD_5) return 4;
-  if (adc_value < ADC_THRESHOLD_6) return 5;
+  for (int i = 0; i < 6; i++) {
+    if (adc_value >= BTN_LO[i] && adc_value <= BTN_HI[i]) return i;
+  }
   return -1;
 }
 
@@ -195,14 +236,18 @@ static void on_button_pressed(int button_idx) {
   if (button_idx < 0 || button_idx > 4) return;
   Serial.printf("[BTN] Button %d pressed\n", button_idx + 1);
   if (!zb_ready) return;
-  // toggle — в HA видно как переключение этого "света"
-  btn_light_state[button_idx] = !btn_light_state[button_idx];
-  zbButtons[button_idx]->setLight(btn_light_state[button_idx]);
+  // импульс: нажал -> ON (в HA видно срабатывание)
+  btn_light_state[button_idx] = true;
+  reportLight(zbButtons[button_idx], true);
 }
 
 static void on_button_released(int button_idx) {
-  // ничего: toggle уже отправлен при нажатии
-  (void)button_idx;
+  if (button_idx < 0 || button_idx > 4) return;
+  if (!zb_ready) return;
+  // отпустили -> OFF, кнопка не залипает в HA
+  btn_light_state[button_idx] = false;
+  reportLight(zbButtons[button_idx], false);
+  Serial.printf("[BTN] Button %d released\n", button_idx + 1);
 }
 
 // =====================================================
@@ -332,25 +377,30 @@ void setup() {
 
   // === ZIGBEE ENDPOINTS ===
   zbRelay1.setManufacturerAndModel("VITAZGIO", "ReleTable");
+  zbRelay1.setPowerSource(ZB_POWER_SOURCE_MAINS);
   zbRelay1.onLightChange(onRelay1Change);
   Zigbee.addEndpoint(&zbRelay1);
 
   zbRelay2.setManufacturerAndModel("VITAZGIO", "ReleTable");
+  zbRelay2.setPowerSource(ZB_POWER_SOURCE_MAINS);
   zbRelay2.onLightChange(onRelay2Change);
   Zigbee.addEndpoint(&zbRelay2);
 
   zbUSB.setManufacturerAndModel("VITAZGIO", "ReleTable");
+  zbUSB.setPowerSource(ZB_POWER_SOURCE_MAINS);
   zbUSB.onLightChange(onUSBChange);
   Zigbee.addEndpoint(&zbUSB);
 
   // Вентилятор (analog output)
   zbFan.setManufacturerAndModel("VITAZGIO", "ReleTable");
+  zbFan.setPowerSource(ZB_POWER_SOURCE_MAINS);
   zbFan.addAnalogOutput();
   zbFan.onAnalogOutputChange(onFanChange);
   Zigbee.addEndpoint(&zbFan);
 
   // Датчик температуры
   zbTemp.setManufacturerAndModel("VITAZGIO", "ReleTable");
+  zbTemp.setPowerSource(ZB_POWER_SOURCE_MAINS);
   zbTemp.setMinMaxValue(-10, 125);
   zbTemp.setTolerance(0.5);
   Zigbee.addEndpoint(&zbTemp);
@@ -358,27 +408,20 @@ void setup() {
   // Кнопки 1-5 (ContactSwitch)
   for (int i = 0; i < 5; i++) {
     zbButtons[i]->setManufacturerAndModel("VITAZGIO", "ReleTable");
+    zbButtons[i]->setPowerSource(ZB_POWER_SOURCE_MAINS);
     zbButtons[i]->onLightChange(onButtonLightChange);
     Zigbee.addEndpoint(zbButtons[i]);
   }
 
   // === СТАРТ ZIGBEE (Router) ===
+  // НЕ блокируем setup ожиданием сети — стек стартует, loop работает дальше.
   Serial.println("[ZB] Starting Zigbee Router...");
   if (!Zigbee.begin(ZIGBEE_ROUTER)) {
-    Serial.println("[ZB] Zigbee begin FAILED! Rebooting...");
-    delay(1000);
-    ESP.restart();
+    Serial.println("[ZB] Stack failed to start. Check zigbee.csv / -DZIGBEE_MODE_ZCZR");
+  } else {
+    Serial.println("[ZB] Stack started, searching network...");
   }
 
-  Serial.println("[ZB] Waiting for network...");
-  while (!Zigbee.connected()) {
-    Serial.print(".");
-    delay(100);
-  }
-  Serial.println("\n[ZB] Connected!");
-
-  // Кнопки теперь ZigbeeLight — начальных значений слать не нужно.
-  zb_ready = true;
   Serial.println("[SETUP] Ready!");
 }
 
@@ -389,36 +432,120 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  int adc_value = read_button_adc();
-  int pressed_raw = detect_button_press(adc_value);
-
-  // Подтверждение: кнопка засчитывается только если детект стабилен 3 раза подряд
-  static int stable_btn = -1;
-  static int stable_cnt = 0;
-  if (pressed_raw == stable_btn) {
-    if (stable_cnt < 3) stable_cnt++;
-  } else {
-    stable_btn = pressed_raw;
-    stable_cnt = 1;
+  // ---- следим за подключением к сети (как в рабочем проекте магнитолы) ----
+  {
+    bool online = Zigbee.connected();
+    if (online != zbOnline) {
+      zbOnline = online;
+      if (online) {
+        Serial.println("[ZB] Подключились к сети");
+        // синхронизируем всё, что видит HA
+        reportLight(&zbRelay1, relay_state[0]);
+        reportLight(&zbRelay2, relay_state[1]);
+        reportLight(&zbUSB, usb_power_state);
+        for (int i = 0; i < 5; i++) reportLight(zbButtons[i], btn_light_state[i]);
+        zb_ready = true;
+      } else {
+        Serial.println("[ZB] Связь с сетью потеряна");
+        zb_ready = false;
+      }
+    }
   }
-  int pressed = (stable_cnt >= 3) ? stable_btn : last_button;
 
-  if (pressed >= 0 && pressed <= 4) {
-    if (pressed != last_button && (now - last_button_press_ms) > DEBOUNCE_MS) {
-      on_button_pressed(pressed);
-      last_button_press_ms = now;
+  // ---- разбираем очередь запросов из HA ----
+  Req r;
+  while (queuePop(r)) {
+    switch (r.type) {
+      case REQ_RELAY1:
+        relay_state[0] = r.value;
+        digitalWrite(RELAY_1_PIN, r.value ? LOW : HIGH);   // active-LOW
+        Serial.printf("[ZB] Relay 1 -> %s\n", r.value ? "ON" : "OFF");
+        break;
+      case REQ_RELAY2:
+        relay_state[1] = r.value;
+        digitalWrite(RELAY_2_PIN, r.value ? LOW : HIGH);   // active-LOW
+        Serial.printf("[ZB] Relay 2 -> %s\n", r.value ? "ON" : "OFF");
+        break;
+      case REQ_USB:
+        usb_power_state = r.value;
+        digitalWrite(MOSFET_USB_PIN, r.value ? HIGH : LOW);
+        Serial.printf("[ZB] USB -> %s\n", r.value ? "ON" : "OFF");
+        break;
+      case REQ_FAN: {
+        int level = (int)round(r.fval / 10.0f);
+        if (level < 0) level = 0;
+        if (level > 10) level = 10;
+        current_fan_speed = level;
+        ledcWrite(FAN_PWM_PIN, FAN_SPEED_PWM[level]);
+        Serial.printf("[ZB] Fan -> %.0f%% (level %d)\n", r.fval, level);
+        break;
+      }
     }
-    last_button = pressed;
-  } else if (pressed == 5) {
-    handle_system_button(5);
-    last_button = pressed;
-  } else {
-    if (last_button == 5) {
-      handle_system_button(-1);
-    } else if (last_button >= 0 && last_button <= 4) {
-      on_button_released(last_button);
+  }
+
+  // подсказка если сети нет
+  static uint32_t lastHint = 0;
+  if (!zbOnline && now - lastHint > 30000) {
+    lastHint = now;
+    Serial.println("[ZB] Нет сети. Открой Permit Join в Zigbee2MQTT.");
+  }
+
+  // кнопки опрашиваем раз в 50 мс — не грузим стек
+  static uint32_t last_adc_ms = 0;
+  static int adc_value = 4095;
+  // btn_cur_state объявлен глобально (виден в диагностике)
+  static int cand = -1;           // кандидат
+  static int cand_cnt = 0;
+
+  if (now - last_adc_ms >= 50) {
+    last_adc_ms = now;
+    adc_value = read_button_adc();
+
+    int raw = detect_button_press(adc_value);
+
+    // подтверждение: 4 одинаковых опроса подряд (200 мс)
+    if (raw == cand) {
+      if (cand_cnt < 4) cand_cnt++;
+    } else {
+      cand = raw;
+      cand_cnt = 1;
     }
-    last_button = -1;
+
+    // КАЛИБРОВКА: печатаем ADC когда значение заметно отличается от "отпущено"
+    static int last_shown = -9999;
+    if (adc_value < 3200 && abs(adc_value - last_shown) > 60) {
+      last_shown = adc_value;
+      Serial.printf("[CAL] ADC=%d  (окно кнопки: %d..%d)\n",
+                    adc_value, adc_value - 120, adc_value + 120);
+    }
+
+    // меняем состояние только по подтверждённому кандидату
+    if (cand_cnt >= 4 && cand != btn_cur_state) {
+      int prev = btn_cur_state;
+      btn_cur_state = cand;
+
+      // Событие ТОЛЬКО при переходе "отпущено (-1)" -> "кнопка"
+      if (prev == -1 && btn_cur_state >= 0 && btn_cur_state <= 4) {
+        on_button_pressed(btn_cur_state);
+      }
+      // Отпускание: кнопка -> отпущено (или другая кнопка) => гасим прошлую
+      if (prev >= 0 && prev <= 4 && btn_cur_state != prev) {
+        on_button_released(prev);
+      }
+      // системная кнопка (6-я)
+      if (prev == -1 && btn_cur_state == 5) {
+        handle_system_button(5);
+      }
+      if (prev == 5 && btn_cur_state == -1) {
+        handle_system_button(-1);
+      }
+      last_button = btn_cur_state;
+    }
+
+    // удержание системной кнопки (для Factory Reset по таймеру)
+    if (btn_cur_state == 5) {
+      handle_system_button(5);
+    }
   }
 
   temperature_read();
@@ -426,10 +553,10 @@ void loop() {
   static uint32_t last_print = 0;
   if (now - last_print > 3000) {
     Serial.printf("[STAT] ADC=%4d btn=%d rel:%d %d usb:%d fan:%d temp:%.1f zb:%d\n",
-                  adc_value, pressed, relay_state[0], relay_state[1],
+                  adc_value, btn_cur_state, relay_state[0], relay_state[1],
                   usb_power_state, current_fan_speed, last_temp, Zigbee.connected());
     last_print = now;
   }
 
-  delay(10);
+  delay(5);
 }
