@@ -27,17 +27,18 @@ const definition = {
             endpointNames: ['temp'],
             reporting: {min: 10, max: 300, change: 50},
         }),
-        // Вентилятор (endpoint 13) — analog output, 0..100%
+        // Вентилятор (endpoint 13). Прошивка ждёт 0..100 (шаг 10),
+        // поэтому в HA показываем 0..10, а на устройство шлём x10.
         numeric({
             name: 'fan_speed',
             cluster: 'genAnalogOutput',
             attribute: 'presentValue',
             endpointName: 'fan',
             valueMin: 0,
-            valueMax: 100,
-            valueStep: 10,
-            unit: '%',
-            description: 'Скорость вентилятора',
+            valueMax: 10,
+            valueStep: 1,
+            scale: 10,
+            description: 'Скорость вентилятора (0-10)',
             access: 'ALL',
         }),
     ],
