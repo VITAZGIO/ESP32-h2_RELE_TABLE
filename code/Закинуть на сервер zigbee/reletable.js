@@ -1,4 +1,4 @@
-const {onOff, temperature, numeric} = require('zigbee-herdsman-converters/lib/modernExtend');
+const {onOff, temperature, numeric, linkQuality} = require('zigbee-herdsman-converters/lib/modernExtend');
 
 const definition = {
     zigbeeModel: ['ReleTable'],
@@ -6,6 +6,9 @@ const definition = {
     vendor: 'VITAZGIO',
     description: 'ESP32-H2 реле под столом (2 реле, USB, вентилятор, температура, 5 кнопок)',
     extend: [
+        // Качество связи (LQI). БЕЗ reporting — иначе configure падает
+        // с UNREPORTABLE_ATTRIBUTE на genBasic.zclVersion.
+        linkQuality(),
         // Реле 1 (endpoint 10)
         onOff({endpointNames: ['relay1'], powerOnBehavior: false}),
         // Реле 2 (endpoint 11)
@@ -19,7 +22,11 @@ const definition = {
         onOff({endpointNames: ['btn4'], powerOnBehavior: false}),
         onOff({endpointNames: ['btn5'], powerOnBehavior: false}),
         // Датчик температуры (endpoint 14)
-        temperature({endpointNames: ['temp']}),
+        // min 10с, max 300с, изменение 0.5°C
+        temperature({
+            endpointNames: ['temp'],
+            reporting: {min: 10, max: 300, change: 50},
+        }),
         // Вентилятор (endpoint 13) — analog output, 0..100%
         numeric({
             name: 'fan_speed',

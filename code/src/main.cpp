@@ -330,9 +330,13 @@ static void temperature_read() {
       zbTemp.reportTemperature();
     }
   } else if (ec == OneWireNg::EC_CRC_ERROR) {
-    Serial.println("[TEMP] CRC error");
+    Serial.println("[TEMP] Ошибка CRC — плохой контакт или помеха");
+    temp_sensor_ok = false;
+  } else if (ec == OneWireNg::EC_NO_DEVS) {
+    Serial.println("[TEMP] Датчик не найден на шине (проверь GPIO12 и подтяжку 4.7k к 3.3V)");
+    temp_sensor_ok = false;
   } else {
-    if (temp_sensor_ok) Serial.println("[TEMP] Sensor read failed!");
+    Serial.printf("[TEMP] Ошибка чтения, код %d\n", (int)ec);
     temp_sensor_ok = false;
   }
 }
@@ -367,13 +371,24 @@ void setup() {
   Serial.println("[FAN] PWM ready");
 
   // === DS18B20 (OneWireNg / DSTherm) ===
-  new (&ow) OneWireNg_CurrentPlatform(PSU_TEMP_PIN, false);
+  new (&ow) OneWireNg_CurrentPlatform(PSU_TEMP_PIN, true);  // true = внутренняя подтяжка
   {
     DSTherm drv(ow);
     drv.writeScratchpadAll(0, 0, DSTherm::RES_12_BIT);  // 12 бит разрешение
     drv.copyScratchpadAll(false);
   }
-  Serial.println("[TEMP] DS18B20 ready (OneWireNg)");
+  // пробное чтение — сразу видно, есть датчик или нет
+  {
+    DSTherm drv(ow);
+    drv.convertTempAll(DSTherm::MAX_CONV_TIME, false);
+    static PlaceholderInit<DSTherm::Scratchpad> sp0;
+    OneWireNg::ErrorCode ec0 = drv.readScratchpadSingle(sp0);
+    if (ec0 == OneWireNg::EC_SUCCESS) {
+      Serial.printf("[TEMP] DS18B20 найден, сейчас %.2f C\n", (float)sp0->getTemp2() / 16.0f);
+    } else {
+      Serial.printf("[TEMP] DS18B20 НЕ найден (код %d). Проверь: GPIO12, подтяжка 4.7k к 3.3V, питание датчика\n", (int)ec0);
+    }
+  }
 
   // === ZIGBEE ENDPOINTS ===
   zbRelay1.setManufacturerAndModel("VITAZGIO", "ReleTable");
